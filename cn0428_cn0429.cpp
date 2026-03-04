@@ -63,6 +63,8 @@ extern const uint8_t		sensor_addresses[];
 extern uint8_t			TXbuff[256];
 extern char			&tempChar; 	/* Guaranteed to be followed by 0 */
 void CN0429_RdCap(uint8_t *args);
+void CN0429_RunOCV(uint8_t *args);
+void CN0429_ReadOCV(uint8_t *args);
 
 M355_GAS m355_gas_sensor;
 Gas_Sensor *pGasSensor = &m355_gas_sensor;
@@ -133,6 +135,9 @@ char const *CmdCommands[] = {
 	"stopread",
 	"setupdaterate",
 	"readcap",
+	"runocv",
+	"readocv",
+
 	""
 };
 
@@ -161,7 +166,9 @@ cmdFunc CmdFun[] = {
 	CN0429_RdSensors,
 	CN0429_StopRd,
 	CN0429_CfgUpdateRate,
-	CN0429_RdCap
+	CN0429_RdCap,
+	CN0429_RunOCV,
+	CN0429_ReadOCV
 
 };
 
@@ -776,6 +783,63 @@ void CN0429_CfgSens(uint8_t *args)
  @param args - pointer to the arguments on the command line.
  @return none
  **/
+void CN0429_RunOCV(uint8_t *args)
+{
+    eSensorResult = pGasSensor->open(uiDefaultAddress);
+    if (eSensorResult != SENSOR_ERROR_NONE) {
+        UART_TX("ERROR opening sensor!" _EOS);
+        return;
+    }
+
+    eSensorResult = pGasSensor->RunOCVMeasurement();
+    if (eSensorResult != SENSOR_ERROR_NONE) {
+        UART_TX("ERROR starting OCV measurement!" _EOS);
+    } else {
+        UART_TX("OCV measurement started..." _EOS);
+    }
+
+    pGasSensor->close();
+}
+void CN0429_ReadOCV(uint8_t *args)
+{
+    int16_t ocv_lsb = 0;
+
+    eSensorResult = pGasSensor->open(uiDefaultAddress);
+    if (eSensorResult != SENSOR_ERROR_NONE) {
+        UART_TX("ERROR opening sensor!" _EOS);
+        return;
+    }
+
+    eSensorResult = pGasSensor->ReadOCVResult(&ocv_lsb);
+    if (eSensorResult != SENSOR_ERROR_NONE) {
+        UART_TX("ERROR reading OCV result!" _EOS);
+        pGasSensor->close();
+        return;
+    }
+
+    pGasSensor->close();
+
+    /* -------- RAW DEBUG PRINTS -------- */
+
+    uint16_t raw_unsigned = (uint16_t)ocv_lsb;
+    int32_t  signed_delta = (int32_t)raw_unsigned - 32768;
+
+    /* -------- ADC SCALING -------- */
+    /* Change this if your ADC reference is different */
+    const float ADC_LSB_V = 0.0000559f;   // 55.9 µV per LSB
+    float ocv_mV = signed_delta * ADC_LSB_V * 1000.0f;
+
+    snprintf((char*)TXbuff, 256,
+             "RAW_LSB = %u (0x%04X), DELTA = %ld, OCV = %.3f mV%s",
+             raw_unsigned,
+             raw_unsigned,
+             signed_delta,
+             ocv_mV,
+             _EOS);
+
+    UART_TX((const char*)TXbuff);
+}
+//RunEISMeasurement()
 void CN0429_RunEIS(uint8_t *args)
 {
 	eSensorResult = pGasSensor->open(uiDefaultAddress);

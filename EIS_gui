@@ -1,0 +1,1136 @@
+import tkinter as tk
+from tkinter import ttk, filedialog
+import threading
+import serial
+import serial.tools.list_ports
+import time
+import math
+from queue import Queue, Empty
+from datetime import datetime
+import pandas as pd
+
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
+
+COMMANDS = [
+    "help", "sensorsconnected", "readconfigs", "readtemp", "readhum",
+    "runeis", "readeis", "readeisfull", "readsensors", "stopread",
+    "startmeas", "stopmeas", "readrcal",
+    "runocv", "readocv",
+]
+
+
+def list_ports():
+    return [p.device for p in serial.tools.list_ports.comports()]
+
+
+def now():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def safe_float(s):
+    try:
+        return float(s.strip())
+    except Exception:
+        return None
+
+
+def parse_eis(line):
+    parts = line.split(",")
+    if len(parts) < 3:
+        return None
+    f = safe_float(parts[0])
+    z = safe_float(parts[1])
+    ph = safe_float(parts[2])
+    if f is None or z is None or ph is None:
+        return None
+    return f, z, ph
+
+
+def capacitance_nf(f, z, ph):
+    """
+    Compute capacitance in nanofarads from EIS data.
+    Phase ph is expected in DEGREES (as received from hardware).
+    Converts to radians internally before computing the imaginary
+    part of impedance: X = Z * sin(phase_rad).
+    C = 1 / (omega * |X|)  [in Farads], converted to nF (* 1e9).
+    """
+    w = 2 * math.pi * f
+    ph_rad = math.radians(ph)          # degrees → radians (correct)
+    X = z * math.sin(ph_rad)
+    if abs(X) < 1e-12:
+        return float("nan")
+    return (1 / (w * abs(X))) * 1e9
+
+
+def capacitance_nf_rad(f, z, ph):
+    """
+    Compute capacitance in nanofarads from EIS data.
+    Phase ph is expected in DEGREES (as received from hardware).
+    This function explicitly shows the radians conversion step
+    for transparency — it produces the same result as capacitance_nf().
+    The 'Capacitance (rad)' tab uses this to confirm consistency
+    between both calculation paths.
+    C = 1 / (omega * |Z * sin(ph_rad)|)  [nF]
+    """
+    w = 2 * math.pi * f
+    ph_rad = math.radians(ph)          # degrees → radians (correct)
+    X = z * math.sin(ph_rad)
+    if abs(X) < 1e-12:
+        return float("nan")
+    return (1 / (w * abs(X))) * 1e9
+
+
+class CN0429GUI:
+    def __init__(self, root):
+        self.root = root
+        root.title("CN0429 Lab Console - By Aniket")
+        root.geometry("1600x900")
+
+        self.ser = None
+        self.stop_evt = threading.Event()
+        self.rx_q = Queue()
+
+        # auto-mode cancel flags
+        self.stop_auto_eis = threading.Event()
+        self.stop_auto_ocv = threading.Event()
+
+        # time origins
+        self.global_start_time = time.time()
+        self.ocv_data_start_time = None
+        self.cap_data_start_time = None
+
+        # in-memory logs
+        self.term_log = []
+        self.k1_log = []
+        self.cap_log = []       # {"time", "t_sec", "cap"}
+        self.ocv_log = []       # {"time", "t_sec", "ocv"}
+        self.cap_rad_log = []   # {"time", "t_sec", "cap_rad"}  (was cap_deg_log)
+
+        # realtime file handles
+        self.term_file = None
+        self.k1_file = None
+        self.cap_file = None
+        self.ocv_file = None
+        self.cap_rad_file = None   # was cap_deg_file
+
+        # plotting
+        self.ocv_fig = None
+        self.ocv_ax = None
+        self.ocv_line = None
+        self.ocv_canvas = None
+        self.ocv_toolbar = None
+
+        self.cap_fig = None
+        self.cap_ax = None
+        self.cap_line = None
+        self.cap_canvas = None
+        self.cap_toolbar = None
+
+        # Plot time mode: "global" or "data"
+        self.ocv_time_mode = tk.StringVar(value="global")
+        self.cap_time_mode = tk.StringVar(value="global")
+
+        # Plot style: "Line" or "Scatter"
+        self.ocv_plot_style = tk.StringVar(value="Line")
+        self.cap_plot_style = tk.StringVar(value="Line")
+
+        # Target frequency (Hz) – user adjustable
+        self.target_freq = 1000.0
+        self.target_freq_var = tk.StringVar(value="1000")
+
+        self._build_ui()
+        self._ui_loop()
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        top = ttk.Frame(self.root, padding=6)
+        top.pack(fill=tk.X)
+
+        ttk.Label(top, text="COM").pack(side=tk.LEFT)
+        self.port = tk.StringVar()
+        self.port_combo = ttk.Combobox(
+            top, textvariable=self.port, values=list_ports(), width=10
+        )
+        self.port_combo.pack(side=tk.LEFT)
+
+        ttk.Button(
+            top, text="Refresh",
+            command=lambda: self.port_combo.config(values=list_ports())
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(top, text="Connect", command=self.connect).pack(side=tk.LEFT)
+        ttk.Button(top, text="Disconnect", command=self.disconnect).pack(side=tk.LEFT)
+
+        ttk.Label(top, text="Sensor").pack(side=tk.LEFT, padx=5)
+        self.sensor = tk.StringVar(value="1")
+        ttk.Combobox(
+            top, textvariable=self.sensor, values=["1", "2", "3", "4"], width=3
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            top, text="Set",
+            command=lambda: self.send(f"switchsensor {self.sensor.get()}")
+        ).pack(side=tk.LEFT)
+
+        ttk.Label(top, text="VBias").pack(side=tk.LEFT, padx=5)
+        self.vbias = tk.StringVar(value="0")
+        ttk.Combobox(
+            top, textvariable=self.vbias,
+            values=[str(i) for i in range(11)], width=4
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            top, text="Apply",
+            command=self.apply_manual_vbias
+        ).pack(side=tk.LEFT)
+
+        # Target frequency controls
+        ttk.Label(top, text="Target Freq (Hz)").pack(side=tk.LEFT, padx=(10, 0))
+        tf_entry = ttk.Entry(top, textvariable=self.target_freq_var, width=8)
+        tf_entry.pack(side=tk.LEFT)
+        ttk.Button(top, text="Set Freq", command=self.apply_target_freq).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(top, text="Auto EIS", command=self.auto_dialog).pack(side=tk.LEFT, padx=8)
+        ttk.Button(top, text="Auto OCV", command=self.auto_ocv_dialog).pack(side=tk.LEFT, padx=8)
+        ttk.Button(top, text="Auto Both", command=self.auto_both_dialog).pack(side=tk.LEFT, padx=8)
+
+        ttk.Button(top, text="Stop Auto", command=self.stop_all_auto).pack(side=tk.LEFT, padx=8)
+
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill=tk.BOTH, expand=True)
+
+        self.tab_term     = ttk.Frame(self.nb)
+        self.tab_1k       = ttk.Frame(self.nb)
+        self.tab_cap      = ttk.Frame(self.nb)
+        self.tab_cap_rad  = ttk.Frame(self.nb)   # renamed from tab_cap_deg
+        self.tab_ocv      = ttk.Frame(self.nb)
+        self.tab_ocv_plot = ttk.Frame(self.nb)
+        self.tab_cap_plot = ttk.Frame(self.nb)
+
+        self.nb.add(self.tab_term,     text="Terminal")
+        self.nb.add(self.tab_1k,       text="Filtered Impedance")
+        self.nb.add(self.tab_cap,      text="Capacitance (degrees)")
+        self.nb.add(self.tab_cap_rad,  text="Capacitance (rad path)")  # both tabs now show correct values
+        self.nb.add(self.tab_ocv,      text="OCV")
+        self.nb.add(self.tab_ocv_plot, text="OCV Plot")
+        self.nb.add(self.tab_cap_plot, text="Capacitance Plot")
+
+        # ---- Terminal tab ----
+        self.term = tk.Text(self.tab_term)
+        self.term.pack(fill=tk.BOTH, expand=True)
+
+        tf = ttk.Frame(self.tab_term)
+        tf.pack(fill=tk.X)
+        ttk.Button(tf, text="Start Log", command=self.start_term_log).pack(side=tk.LEFT)
+        ttk.Button(tf, text="Stop Log",  command=self.stop_term_log).pack(side=tk.LEFT)
+        ttk.Button(tf, text="Export CSV",
+                   command=lambda: self.export(self.term_log, "terminal.csv")).pack(side=tk.LEFT)
+        ttk.Button(tf, text="Export Excel",
+                   command=lambda: self.export_excel(self.term_log, "terminal.xlsx")).pack(side=tk.LEFT)
+
+        cmd_frame = ttk.Frame(self.tab_term)
+        cmd_frame.pack(fill=tk.X)
+        for c in COMMANDS:
+            ttk.Button(
+                cmd_frame, text=c,
+                command=lambda cmd=c: self.send(cmd)
+            ).pack(side=tk.LEFT, padx=2)
+
+        entry = ttk.Entry(self.tab_term)
+        entry.pack(fill=tk.X)
+        entry.bind("<Return>", lambda e: self.send(entry.get(), entry))
+
+        # ---- Filtered impedance (around target freq) tab ----
+        self.f1k = tk.Text(self.tab_1k)
+        self.f1k.pack(fill=tk.BOTH, expand=True)
+
+        f1 = ttk.Frame(self.tab_1k)
+        f1.pack(fill=tk.X)
+        ttk.Button(f1, text="Start Log", command=self.start_1k_log).pack(side=tk.LEFT)
+        ttk.Button(f1, text="Stop Log",  command=self.stop_1k_log).pack(side=tk.LEFT)
+        ttk.Button(f1, text="Export CSV",
+                   command=lambda: self.export(self.k1_log, "filtered_freq.csv")).pack(side=tk.LEFT)
+        ttk.Button(f1, text="Export Excel",
+                   command=lambda: self.export_excel(self.k1_log, "filtered_freq.xlsx")).pack(side=tk.LEFT)
+
+        # ---- Capacitance tab ----
+        self.cap = tk.Text(self.tab_cap)
+        self.cap.pack(fill=tk.BOTH, expand=True)
+
+        f2 = ttk.Frame(self.tab_cap)
+        f2.pack(fill=tk.X)
+        ttk.Button(f2, text="Start Log", command=self.start_cap_log).pack(side=tk.LEFT)
+        ttk.Button(f2, text="Stop Log",  command=self.stop_cap_log).pack(side=tk.LEFT)
+        ttk.Button(f2, text="Export CSV",
+                   command=lambda: self.export(self.cap_log, "cap.csv")).pack(side=tk.LEFT)
+        ttk.Button(f2, text="Export Excel",
+                   command=lambda: self.export_excel(self.cap_log, "cap.xlsx")).pack(side=tk.LEFT)
+
+        # ---- OCV text tab ----
+        self.ocv_box = tk.Text(self.tab_ocv)
+        self.ocv_box.pack(fill=tk.BOTH, expand=True)
+
+        f3 = ttk.Frame(self.tab_ocv)
+        f3.pack(fill=tk.X)
+        ttk.Button(f3, text="Start Log", command=self.start_ocv_log).pack(side=tk.LEFT)
+        ttk.Button(f3, text="Stop Log",  command=self.stop_ocv_log).pack(side=tk.LEFT)
+        ttk.Button(f3, text="Export CSV",
+                   command=lambda: self.export(self.ocv_log, "ocv.csv")).pack(side=tk.LEFT)
+        ttk.Button(f3, text="Export Excel",
+                   command=lambda: self.export_excel(self.ocv_log, "ocv.xlsx")).pack(side=tk.LEFT)
+
+        # ---- Capacitance (rad path) tab ----
+        self.cap_rad = tk.Text(self.tab_cap_rad)
+        self.cap_rad.pack(fill=tk.BOTH, expand=True)
+
+        f2b = ttk.Frame(self.tab_cap_rad)
+        f2b.pack(fill=tk.X)
+        ttk.Button(f2b, text="Start Log", command=self.start_cap_rad_log).pack(side=tk.LEFT)
+        ttk.Button(f2b, text="Stop Log",  command=self.stop_cap_rad_log).pack(side=tk.LEFT)
+        ttk.Button(f2b, text="Export CSV",
+                   command=lambda: self.export(self.cap_rad_log, "cap_rad.csv")).pack(side=tk.LEFT)
+        ttk.Button(f2b, text="Export Excel",
+                   command=lambda: self.export_excel(self.cap_rad_log, "cap_rad.xlsx")).pack(side=tk.LEFT)
+
+        # ---- Plots ----
+        self._build_ocv_plot(self.tab_ocv_plot)
+        self._build_cap_plot(self.tab_cap_plot)
+
+    def _build_ocv_plot(self, parent):
+        self.ocv_fig = Figure(figsize=(7, 5), dpi=100)
+        self.ocv_ax  = self.ocv_fig.add_subplot(111)
+        self.ocv_ax.set_title("OCV / EMF vs Time")
+        self.ocv_ax.set_xlabel("Time (s)")
+        self.ocv_ax.set_ylabel("OCV (mV)")
+        self.ocv_ax.grid(True, linestyle="--", alpha=0.7)
+
+        self.ocv_line, = self.ocv_ax.plot([], [], "b-o", markersize=3, linewidth=1)
+
+        self.ocv_canvas = FigureCanvasTkAgg(self.ocv_fig, master=parent)
+        self.ocv_canvas.draw()
+        self.ocv_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        ctrl_frame = ttk.Frame(parent)
+        ctrl_frame.pack(fill=tk.X)
+
+        ttk.Label(ctrl_frame, text="Time mode:").pack(side=tk.LEFT)
+        self.ocv_time_combo = ttk.Combobox(
+            ctrl_frame, textvariable=self.ocv_time_mode,
+            values=["global", "data"], state="readonly", width=8
+        )
+        self.ocv_time_combo.pack(side=tk.LEFT, padx=5)
+        self.ocv_time_combo.bind("<<ComboboxSelected>>", lambda e: self.update_ocv_plot())
+
+        ttk.Label(ctrl_frame, text="Plot style:").pack(side=tk.LEFT, padx=(10, 0))
+        self.ocv_style_combo = ttk.Combobox(
+            ctrl_frame, textvariable=self.ocv_plot_style,
+            values=["Line", "Scatter"], state="readonly", width=8
+        )
+        self.ocv_style_combo.pack(side=tk.LEFT, padx=5)
+        self.ocv_style_combo.bind("<<ComboboxSelected>>", lambda e: self.update_ocv_plot())
+
+        toolbar_frame = ttk.Frame(parent)
+        toolbar_frame.pack(fill=tk.X)
+        self.ocv_toolbar = NavigationToolbar2Tk(self.ocv_canvas, toolbar_frame)
+        self.ocv_toolbar.update()
+
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="Reset Plot",
+                   command=self.reset_ocv_plot).pack(side=tk.LEFT, padx=5, pady=2)
+
+    def _build_cap_plot(self, parent):
+        self.cap_fig = Figure(figsize=(7, 5), dpi=100)
+        self.cap_ax  = self.cap_fig.add_subplot(111)
+        self.cap_ax.set_title("Capacitance vs Time (filtered freq)")
+        self.cap_ax.set_xlabel("Time (s)")
+        self.cap_ax.set_ylabel("Capacitance (nF)")
+        self.cap_ax.grid(True, linestyle="--", alpha=0.7)
+
+        self.cap_line, = self.cap_ax.plot([], [], "r-s", markersize=3, linewidth=1)
+
+        self.cap_canvas = FigureCanvasTkAgg(self.cap_fig, master=parent)
+        self.cap_canvas.draw()
+        self.cap_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        ctrl_frame = ttk.Frame(parent)
+        ctrl_frame.pack(fill=tk.X)
+
+        ttk.Label(ctrl_frame, text="Time mode:").pack(side=tk.LEFT)
+        self.cap_time_combo = ttk.Combobox(
+            ctrl_frame, textvariable=self.cap_time_mode,
+            values=["global", "data"], state="readonly", width=8
+        )
+        self.cap_time_combo.pack(side=tk.LEFT, padx=5)
+        self.cap_time_combo.bind("<<ComboboxSelected>>", lambda e: self.update_cap_plot())
+
+        ttk.Label(ctrl_frame, text="Plot style:").pack(side=tk.LEFT, padx=(10, 0))
+        self.cap_style_combo = ttk.Combobox(
+            ctrl_frame, textvariable=self.cap_plot_style,
+            values=["Line", "Scatter"], state="readonly", width=8
+        )
+        self.cap_style_combo.pack(side=tk.LEFT, padx=5)
+        self.cap_style_combo.bind("<<ComboboxSelected>>", lambda e: self.update_cap_plot())
+
+        toolbar_frame = ttk.Frame(parent)
+        toolbar_frame.pack(fill=tk.X)
+        self.cap_toolbar = NavigationToolbar2Tk(self.cap_canvas, toolbar_frame)
+        self.cap_toolbar.update()
+
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="Reset Plot",
+                   command=self.reset_cap_plot).pack(side=tk.LEFT, padx=5, pady=2)
+
+    # ---------- Serial ----------
+    def connect(self):
+        self.ser = serial.Serial(self.port.get(), 115200, timeout=0.2)
+        self.stop_evt.clear()
+        threading.Thread(target=self.reader, daemon=True).start()
+        self.write(self.term, "CONNECTED\n")
+
+    def disconnect(self):
+        self.stop_evt.set()
+        if self.ser:
+            self.ser.close()
+        self.ser = None
+        self.write(self.term, "DISCONNECTED\n")
+
+    def reader(self):
+        while not self.stop_evt.is_set():
+            data = self.ser.read(1024)
+            if data:
+                self.rx_q.put(data.decode(errors="ignore"))
+
+    # ---------- Send / VBias / Target freq ----------
+    def send(self, cmd, entry=None):
+        if not self.ser or not cmd:
+            return
+        self.ser.write((cmd + "\r").encode())
+        self.write(self.term, f"[TX] {cmd}\n")
+        if entry:
+            entry.delete(0, tk.END)
+
+    def apply_manual_vbias(self):
+        try:
+            v = int(float(self.vbias.get()))
+        except ValueError:
+            self.write(self.term, "[VBias ERROR] Enter integer mV (e.g. 10)\n")
+            return
+        self.send(f"setvbias {v}")
+
+    def apply_target_freq(self):
+        try:
+            f = float(self.target_freq_var.get())
+            if f <= 0:
+                raise ValueError
+        except ValueError:
+            self.write(self.term, "[TARGET FREQ ERROR] Enter positive frequency in Hz\n")
+            return
+        self.target_freq = f
+        self.write(self.term, f"[TARGET FREQ SET] {self.target_freq:.3f} Hz\n")
+
+    # ---------- Logging ----------
+    def start_term_log(self):
+        p = filedialog.asksaveasfilename(defaultextension=".csv")
+        if p:
+            self.term_file = open(p, "w", encoding="utf-8")
+            self.term_file.write("time,raw\n")
+            self.term_file.flush()
+            self.write(self.term, "[LOGGING STARTED - TERMINAL]\n")
+
+    def stop_term_log(self):
+        if self.term_file:
+            self.term_file.close()
+            self.term_file = None
+            self.write(self.term, "[LOGGING STOPPED - TERMINAL]\n")
+
+    def start_1k_log(self):
+        p = filedialog.asksaveasfilename(defaultextension=".csv")
+        if p:
+            self.k1_file = open(p, "w", encoding="utf-8")
+            self.k1_file.write("time,freq,Z,phase\n")
+            self.k1_file.flush()
+            self.write(self.f1k, "[LOGGING STARTED - FILTERED FREQ]\n")
+
+    def stop_1k_log(self):
+        if self.k1_file:
+            self.k1_file.close()
+            self.k1_file = None
+            self.write(self.f1k, "[LOGGING STOPPED - FILTERED FREQ]\n")
+
+    def start_cap_log(self):
+        p = filedialog.asksaveasfilename(defaultextension=".csv")
+        if p:
+            self.cap_file = open(p, "w", encoding="utf-8")
+            self.cap_file.write("time,t_sec,capacitance_nF\n")
+            self.cap_file.flush()
+            self.write(self.cap, "[LOGGING STARTED - CAP]\n")
+
+    def stop_cap_log(self):
+        if self.cap_file:
+            self.cap_file.close()
+            self.cap_file = None
+            self.write(self.cap, "[LOGGING STOPPED - CAP]\n")
+
+    def start_ocv_log(self):
+        p = filedialog.asksaveasfilename(defaultextension=".csv")
+        if p:
+            self.ocv_file = open(p, "w", encoding="utf-8")
+            self.ocv_file.write("time,t_sec,ocv\n")
+            self.ocv_file.flush()
+            self.write(self.ocv_box, "[LOGGING STARTED - OCV]\n")
+
+    def stop_ocv_log(self):
+        if self.ocv_file:
+            self.ocv_file.close()
+            self.ocv_file = None
+            self.write(self.ocv_box, "[LOGGING STOPPED - OCV]\n")
+
+    def start_cap_rad_log(self):
+        p = filedialog.asksaveasfilename(defaultextension=".csv")
+        if p:
+            self.cap_rad_file = open(p, "w", encoding="utf-8")
+            self.cap_rad_file.write("time,t_sec,capacitance_nF_rad_path\n")
+            self.cap_rad_file.flush()
+            self.write(self.cap_rad, "[LOGGING STARTED - CAP RAD PATH]\n")
+
+    def stop_cap_rad_log(self):
+        if self.cap_rad_file:
+            self.cap_rad_file.close()
+            self.cap_rad_file = None
+            self.write(self.cap_rad, "[LOGGING STOPPED - CAP RAD PATH]\n")
+
+    # ---------- Export helpers ----------
+    def export(self, log, default_name):
+        if not log:
+            return
+        p = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=default_name)
+        if not p:
+            return
+        df = pd.DataFrame(log)
+        df.to_csv(p, index=False)
+
+    def export_excel(self, log, default_name):
+        if not log:
+            return
+        p = filedialog.asksaveasfilename(defaultextension=".xlsx", initialfile=default_name)
+        if not p:
+            return
+        df = pd.DataFrame(log)
+        df.to_excel(p, index=False)
+
+    # ---------- Auto EIS ----------
+    def auto_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Auto EIS")
+
+        ttk.Label(win, text="Duration (min)").grid(row=0, column=0)
+        dur = ttk.Entry(win)
+        dur.insert(0, "2")
+        dur.grid(row=0, column=1)
+
+        ttk.Label(win, text="Wait runeis (s)").grid(row=1, column=0)
+        w1 = ttk.Entry(win)
+        w1.insert(0, "6")
+        w1.grid(row=1, column=1)
+
+        ttk.Label(win, text="Wait readeis (s)").grid(row=2, column=0)
+        w2 = ttk.Entry(win)
+        w2.insert(0, "2")
+        w2.grid(row=2, column=1)
+
+        def start():
+            try:
+                minutes = float(dur.get())
+                w_run  = float(w1.get())
+                w_read = float(w2.get())
+            except ValueError:
+                self.write(self.term, "[AUTO EIS ERROR] Invalid numeric input\n")
+                return
+
+            self.stop_auto_eis.clear()
+            threading.Thread(
+                target=self.auto_loop,
+                args=(minutes, w_run, w_read),
+                daemon=True
+            ).start()
+            win.destroy()
+
+        ttk.Button(win, text="Start", command=start).grid(row=3, column=0, columnspan=2)
+
+    def auto_loop(self, minutes, w1, w2):
+        end = time.time() + minutes * 60
+        self.write(self.term, "[AUTO START]\n")
+        while time.time() < end and not self.stop_evt.is_set() and not self.stop_auto_eis.is_set():
+            self.send("runeis")
+            time.sleep(w1)
+            self.send("readeis")
+            time.sleep(w2)
+        self.write(self.term, "[AUTO END]\n")
+
+    # ---------- Auto OCV ----------
+    def auto_ocv_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Auto OCV")
+
+        ttk.Label(win, text="Duration (min)").grid(row=0, column=0, sticky="w")
+        dur_entry = ttk.Entry(win)
+        dur_entry.insert(0, "5")
+        dur_entry.grid(row=0, column=1)
+
+        ttk.Label(win, text="Sampling mode").grid(row=1, column=0, sticky="w")
+        mode = tk.StringVar(value="samples/sec")
+        mode_combo = ttk.Combobox(
+            win, textvariable=mode,
+            values=["samples/sec", "sec", "ms"],
+            width=12, state="readonly"
+        )
+        mode_combo.grid(row=1, column=1)
+
+        ttk.Label(win, text="Sampling value").grid(row=2, column=0, sticky="w")
+        val_entry = ttk.Entry(win)
+        val_entry.insert(0, "50")
+        val_entry.grid(row=2, column=1)
+
+        ttk.Label(win, text="Wait runocv (s)").grid(row=3, column=0, sticky="w")
+        w_run_entry = ttk.Entry(win)
+        w_run_entry.insert(0, "0.2")
+        w_run_entry.grid(row=3, column=1)
+
+        ttk.Label(win, text="Wait readocv (s)").grid(row=4, column=0, sticky="w")
+        w_read_entry = ttk.Entry(win)
+        w_read_entry.insert(0, "0.1")
+        w_read_entry.grid(row=4, column=1)
+
+        def compute_period():
+            try:
+                v = float(val_entry.get())
+            except ValueError:
+                return None
+            if mode.get() == "samples/sec":
+                if v <= 0:
+                    return None
+                return 1.0 / v
+            elif mode.get() == "sec":
+                return max(v, 0.001)
+            else:  # "ms"
+                return max(v / 1000.0, 0.001)
+
+        def start():
+            try:
+                minutes = float(dur_entry.get())
+                w_run   = float(w_run_entry.get())
+                w_read  = float(w_read_entry.get())
+            except ValueError:
+                self.write(self.term, "[AUTO OCV ERROR] Invalid numeric input\n")
+                return
+
+            period = compute_period()
+            if period is None:
+                self.write(self.term, "[AUTO OCV ERROR] Invalid sampling rate\n")
+                return
+
+            min_period = w_run + w_read
+            if period < min_period:
+                period = min_period
+
+            self.stop_auto_ocv.clear()
+            threading.Thread(
+                target=self.auto_ocv_loop,
+                args=(minutes, period, w_run, w_read),
+                daemon=True
+            ).start()
+            win.destroy()
+
+        ttk.Button(win, text="Start", command=start).grid(row=5, column=0, columnspan=2, pady=5)
+
+    def auto_ocv_loop(self, minutes, period_sec, w_run, w_read):
+        end = time.time() + minutes * 60.0
+        self.write(
+            self.term,
+            f"[AUTO OCV START] duration={minutes:.2f} min, period={period_sec:.3f} s, "
+            f"wait_run={w_run:.3f} s, wait_read={w_read:.3f} s\n"
+        )
+
+        while time.time() < end and not self.stop_evt.is_set() and not self.stop_auto_ocv.is_set():
+            cycle_start = time.time()
+
+            self.send("runocv")
+            time.sleep(max(w_run, 0.0))
+
+            self.send("readocv")
+            time.sleep(max(w_read, 0.0))
+
+            elapsed = time.time() - cycle_start
+            remain  = period_sec - elapsed
+            if remain > 0:
+                time.sleep(remain)
+
+        self.write(self.term, "[AUTO OCV END]\n")
+
+    # ---------- Auto BOTH (cyclic OCV+EIS) with bias checkboxes ----------
+    def auto_both_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Auto OCV + EIS")
+        win.geometry("430x620")
+
+        row = 0
+
+        ttk.Label(win, text="Total duration (min)", font=('TkDefaultFont', 10, 'bold')).grid(
+            row=row, column=0, sticky="w", pady=2
+        )
+        row += 1
+        ttk.Label(win, text="Total duration (min)").grid(row=row, column=0, sticky="w")
+        dur_entry = ttk.Entry(win)
+        dur_entry.insert(0, "60")
+        dur_entry.grid(row=row, column=1)
+        row += 1
+
+        ttk.Label(win, text="First phase").grid(row=row, column=0, sticky="w")
+        first_phase = tk.StringVar(value="OCV")
+        first_phase_combo = ttk.Combobox(
+            win, textvariable=first_phase,
+            values=["OCV", "EIS"], state="readonly", width=10
+        )
+        first_phase_combo.grid(row=row, column=1)
+        row += 1
+
+        ttk.Separator(win, orient='horizontal').grid(row=row, column=0, columnspan=2,
+                                                     sticky="ew", pady=5)
+        row += 1
+
+        ttk.Label(win, text="=== OCV PHASE ===", font=('TkDefaultFont', 10, 'bold')).grid(
+            row=row, column=0, columnspan=2, sticky="w"
+        )
+        row += 1
+
+        ttk.Label(win, text="OCV duration per cycle (min)").grid(row=row, column=0, sticky="w")
+        ocv_min_entry = ttk.Entry(win)
+        ocv_min_entry.insert(0, "5")
+        ocv_min_entry.grid(row=row, column=1)
+        row += 1
+
+        ttk.Label(win, text="OCV VBias (mV, int)").grid(row=row, column=0, sticky="w")
+        ocv_bias_entry = ttk.Entry(win)
+        ocv_bias_entry.insert(0, "0")
+        ocv_bias_entry.grid(row=row, column=1)
+        row += 1
+
+        ocv_bias_enable = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            win, text="Apply OCV bias", variable=ocv_bias_enable
+        ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
+        ttk.Label(win, text="OCV sampling mode").grid(row=row, column=0, sticky="w")
+        ocv_mode = tk.StringVar(value="samples/sec")
+        ocv_mode_combo = ttk.Combobox(
+            win, textvariable=ocv_mode,
+            values=["samples/sec", "sec", "ms"],
+            width=12, state="readonly"
+        )
+        ocv_mode_combo.grid(row=row, column=1)
+        row += 1
+
+        ttk.Label(win, text="OCV sampling value").grid(row=row, column=0, sticky="w")
+        ocv_val_entry = ttk.Entry(win)
+        ocv_val_entry.insert(0, "50")
+        ocv_val_entry.grid(row=row, column=1)
+        row += 1
+
+        ttk.Label(win, text="Wait runocv (s)").grid(row=row, column=0, sticky="w")
+        w_run_entry = ttk.Entry(win)
+        w_run_entry.insert(0, "0.2")
+        w_run_entry.grid(row=row, column=1)
+        row += 1
+
+        ttk.Label(win, text="Wait readocv (s)").grid(row=row, column=0, sticky="w")
+        w_read_entry = ttk.Entry(win)
+        w_read_entry.insert(0, "0.1")
+        w_read_entry.grid(row=row, column=1)
+        row += 1
+
+        ttk.Separator(win, orient='horizontal').grid(row=row, column=0, columnspan=2,
+                                                     sticky="ew", pady=5)
+        row += 1
+
+        ttk.Label(win, text="=== EIS PHASE ===", font=('TkDefaultFont', 10, 'bold')).grid(
+            row=row, column=0, columnspan=2, sticky="w"
+        )
+        row += 1
+
+        ttk.Label(win, text="EIS duration per cycle (min)").grid(row=row, column=0, sticky="w")
+        eis_min_entry = ttk.Entry(win)
+        eis_min_entry.insert(0, "1")
+        eis_min_entry.grid(row=row, column=1)
+        row += 1
+
+        ttk.Label(win, text="EIS VBias (mV, int)").grid(row=row, column=0, sticky="w")
+        eis_bias_entry = ttk.Entry(win)
+        eis_bias_entry.insert(0, "1")
+        eis_bias_entry.grid(row=row, column=1)
+        row += 1
+
+        eis_bias_enable = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            win, text="Apply EIS bias", variable=eis_bias_enable
+        ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
+        ttk.Label(win, text="Wait runeis (s)").grid(row=row, column=0, sticky="w")
+        w_eis_run_entry = ttk.Entry(win)
+        w_eis_run_entry.insert(0, "6")
+        w_eis_run_entry.grid(row=row, column=1)
+        row += 1
+
+        ttk.Label(win, text="Wait readeis (s)").grid(row=row, column=0, sticky="w")
+        w_eis_read_entry = ttk.Entry(win)
+        w_eis_read_entry.insert(0, "2")
+        w_eis_read_entry.grid(row=row, column=1)
+        row += 1
+
+        ttk.Separator(win, orient='horizontal').grid(row=row, column=0, columnspan=2,
+                                                     sticky="ew", pady=5)
+        row += 1
+
+        ttk.Label(win, text="=== BUFFER TIME BETWEEN PHASES ===",
+                  font=('TkDefaultFont', 10, 'bold')).grid(
+            row=row, column=0, columnspan=2, sticky="w"
+        )
+        row += 1
+
+        ttk.Label(win, text="Buffer OCV↔EIS (s)").grid(row=row, column=0, sticky="w")
+        buffer_entry = ttk.Entry(win)
+        buffer_entry.insert(0, "10")
+        buffer_entry.grid(row=row, column=1)
+        row += 1
+
+        def compute_ocv_period():
+            try:
+                v = float(ocv_val_entry.get())
+            except ValueError:
+                return None
+            if ocv_mode.get() == "samples/sec":
+                if v <= 0:
+                    return None
+                return 1.0 / v
+            elif ocv_mode.get() == "sec":
+                return max(v, 0.001)
+            else:  # "ms"
+                return max(v / 1000.0, 0.001)
+
+        def start():
+            try:
+                total_min  = float(dur_entry.get())
+                ocv_min    = float(ocv_min_entry.get())
+                eis_min    = float(eis_min_entry.get())
+                ocv_bias   = int(float(ocv_bias_entry.get()))
+                eis_bias   = int(float(eis_bias_entry.get()))
+                buffer_sec = float(buffer_entry.get())
+                w_run      = float(w_run_entry.get())
+                w_read     = float(w_read_entry.get())
+                w_eis_run  = float(w_eis_run_entry.get())
+                w_eis_read = float(w_eis_read_entry.get())
+            except ValueError:
+                self.write(self.term, "[AUTO BOTH ERROR] Invalid numeric input\n")
+                return
+
+            if total_min <= 0 or ocv_min <= 0 or eis_min <= 0:
+                self.write(self.term, "[AUTO BOTH ERROR] Durations must be > 0\n")
+                return
+
+            ocv_period = compute_ocv_period()
+            if ocv_period is None:
+                self.write(self.term, "[AUTO BOTH ERROR] Invalid OCV sampling rate\n")
+                return
+
+            min_ocv_period = w_run + w_read
+            if ocv_period < min_ocv_period:
+                ocv_period = min_ocv_period
+
+            first              = first_phase.get()
+            ocv_bias_enabled   = ocv_bias_enable.get()
+            eis_bias_enabled   = eis_bias_enable.get()
+
+            self.stop_auto_eis.clear()
+            self.stop_auto_ocv.clear()
+            threading.Thread(
+                target=self.auto_both_loop,
+                args=(total_min, ocv_min, eis_min,
+                      ocv_bias, eis_bias, buffer_sec,
+                      ocv_period, w_run, w_read,
+                      w_eis_run, w_eis_read, first,
+                      ocv_bias_enabled, eis_bias_enabled),
+                daemon=True
+            ).start()
+            win.destroy()
+
+        ttk.Button(win, text="Start Auto Both", command=start).grid(
+            row=row, column=0, columnspan=2, pady=10
+        )
+
+    def auto_both_loop(self, total_min, ocv_min, eis_min,
+                       ocv_bias, eis_bias, buffer_sec,
+                       ocv_period, w_run, w_read,
+                       w_eis_run, w_eis_read, first_phase,
+                       ocv_bias_enabled, eis_bias_enabled):
+        end = time.time() + total_min * 60.0
+        self.write(
+            self.term,
+            f"[AUTO BOTH START] total={total_min:.1f} min, "
+            f"OCV={ocv_min:.1f}min@{ocv_bias}mV({'on' if ocv_bias_enabled else 'off'}), "
+            f"EIS={eis_min:.1f}min@{eis_bias}mV({'on' if eis_bias_enabled else 'off'}), "
+            f"buffer={buffer_sec:.1f}s, OCV_period={ocv_period:.3f}s, first={first_phase}\n"
+        )
+
+        ocv_cycle_sec = ocv_min * 60.0
+        eis_cycle_sec = eis_min * 60.0
+
+        def should_stop():
+            return (time.time() >= end or self.stop_evt.is_set()
+                    or self.stop_auto_ocv.is_set() or self.stop_auto_eis.is_set())
+
+        sequence = ["EIS", "OCV"] if first_phase == "EIS" else ["OCV", "EIS"]
+
+        while not should_stop():
+            for phase in sequence:
+                if should_stop():
+                    self.write(self.term, "[AUTO BOTH END - early termination]\n")
+                    return
+
+                if phase == "OCV":
+                    phase_end = min(time.time() + ocv_cycle_sec, end)
+
+                    if ocv_bias_enabled:
+                        self.send(f"setvbias {ocv_bias}")
+                        time.sleep(1.0)
+
+                    self.write(
+                        self.term,
+                        "[AUTO BOTH] OCV phase start "
+                        f"(VBias={'{}mV'.format(ocv_bias) if ocv_bias_enabled else 'unchanged'})\n"
+                    )
+
+                    while time.time() < phase_end and not should_stop():
+                        cycle_start = time.time()
+                        self.send("runocv")
+                        time.sleep(max(w_run, 0.0))
+                        self.send("readocv")
+                        time.sleep(max(w_read, 0.0))
+
+                        elapsed = time.time() - cycle_start
+                        remain  = ocv_period - elapsed
+                        if remain > 0:
+                            time.sleep(remain)
+
+                elif phase == "EIS":
+                    phase_end = min(time.time() + eis_cycle_sec, end)
+
+                    if eis_bias_enabled:
+                        self.send(f"setvbias {eis_bias}")
+                        time.sleep(1.0)
+
+                    self.write(
+                        self.term,
+                        "[AUTO BOTH] EIS phase start "
+                        f"(VBias={'{}mV'.format(eis_bias) if eis_bias_enabled else 'unchanged'})\n"
+                    )
+
+                    while time.time() < phase_end and not should_stop():
+                        self.send("runeis")
+                        time.sleep(max(w_eis_run, 0.0))
+                        self.send("readeis")
+                        time.sleep(max(w_eis_read, 0.0))
+
+                if should_stop():
+                    self.write(self.term, "[AUTO BOTH END - early termination]\n")
+                    return
+
+                self.write(self.term, f"[AUTO BOTH] Buffer time: {buffer_sec:.1f}s\n")
+                t0 = time.time()
+                while time.time() - t0 < buffer_sec and not should_stop():
+                    time.sleep(0.1)
+
+        self.write(self.term, "[AUTO BOTH END]\n")
+
+    # ---------- stop all auto ----------
+    def stop_all_auto(self):
+        self.stop_auto_eis.set()
+        self.stop_auto_ocv.set()
+        self.write(self.term, "[AUTO STOP REQUESTED]\n")
+
+    # ---------- UI Loop ----------
+    def _ui_loop(self):
+        try:
+            while True:
+                txt = self.rx_q.get_nowait()
+                self.process(txt)
+        except Empty:
+            pass
+
+        self.update_ocv_plot()
+        self.update_cap_plot()
+        self.root.after(100, self._ui_loop)
+
+    def write(self, widget, text):
+        widget.insert(tk.END, text)
+        widget.see(tk.END)
+
+    def process(self, txt):
+        t = now()
+
+        # terminal
+        self.write(self.term, txt)
+        self.term_log.append({"time": t, "raw": txt})
+        if self.term_file:
+            self.term_file.write(f"{t},{txt}")
+            self.term_file.flush()
+
+        # ----------------------------------------------------------------
+        # EIS parsing – filter around target_freq
+        # Phase from hardware is in DEGREES.
+        # Both capacitance_nf() and capacitance_nf_rad() correctly convert
+        # degrees → radians using math.radians() before calling math.sin().
+        # ----------------------------------------------------------------
+        for line in txt.splitlines():
+            row = parse_eis(line)
+            if not row:
+                continue
+            f, z, ph = row  # ph is in degrees
+
+            if abs(f - self.target_freq) <= 1.0:
+                self.write(self.f1k, line + "\n")
+                self.k1_log.append({"time": t, "freq": f, "Z": z, "phase": ph})
+                if self.k1_file:
+                    self.k1_file.write(f"{t},{f},{z},{ph}\n")
+                    self.k1_file.flush()
+
+                # --- Primary capacitance (degrees → radians conversion via math.radians) ---
+                c = capacitance_nf(f, z, ph)
+
+                # --- Secondary capacitance (same physics, explicit radians variable shown) ---
+                c_rad = capacitance_nf_rad(f, z, ph)
+
+                t_sec_global = time.time() - self.global_start_time
+
+                # Capacitance tab
+                self.write(self.cap, f"{t} | {f:.1f} Hz | {c:.6f} nF\n")
+                self.cap_log.append({"time": t, "t_sec": t_sec_global, "cap": c})
+                if self.cap_file:
+                    self.cap_file.write(f"{t},{t_sec_global},{c}\n")
+                    self.cap_file.flush()
+
+                # Capacitance (rad path) tab
+                self.write(self.cap_rad,
+                            f"{t} | {f:.1f} Hz | {c_rad:.6f} nF  "
+                            f"[ph_rad={math.radians(ph):.5f}]\n")
+                self.cap_rad_log.append({"time": t, "t_sec": t_sec_global, "cap_rad": c_rad})
+                if self.cap_rad_file:
+                    self.cap_rad_file.write(f"{t},{t_sec_global},{c_rad}\n")
+                    self.cap_rad_file.flush()
+
+                if self.cap_data_start_time is None:
+                    self.cap_data_start_time = t_sec_global
+
+        # OCV capture
+        for line in txt.splitlines():
+            if "OCV" in line or "ocv" in line:
+                parts = line.replace(",", " ").split()
+                val = None
+                for tok in reversed(parts):
+                    v = safe_float(tok)
+                    if v is not None:
+                        val = v
+                        break
+                if val is not None:
+                    t_sec_global = time.time() - self.global_start_time
+                    self.write(self.ocv_box, f"{t} | {val} mV\n")
+                    self.ocv_log.append({"time": t, "t_sec": t_sec_global, "ocv": val})
+                    if self.ocv_file:
+                        self.ocv_file.write(f"{t},{t_sec_global},{val}\n")
+                        self.ocv_file.flush()
+                    if self.ocv_data_start_time is None:
+                        self.ocv_data_start_time = t_sec_global
+
+    # ---------- OCV plot update / reset ----------
+    def update_ocv_plot(self):
+        if not self.ocv_ax or not self.ocv_line:
+            return
+        if not self.ocv_log:
+            return
+
+        xs_global = [row["t_sec"] for row in self.ocv_log]
+        ys        = [row["ocv"]   for row in self.ocv_log]
+        if not xs_global:
+            return
+
+        if self.ocv_time_mode.get() == "data" and self.ocv_data_start_time is not None:
+            xs = [x - self.ocv_data_start_time for x in xs_global]
+        else:
+            xs = xs_global
+
+        if self.ocv_plot_style.get() == "Scatter":
+            self.ocv_line.set_linestyle("")
+            self.ocv_line.set_marker("o")
+        else:
+            self.ocv_line.set_linestyle("-")
+            self.ocv_line.set_marker("o")
+
+        self.ocv_line.set_data(xs, ys)
+        self.ocv_ax.relim()
+        self.ocv_ax.autoscale_view()
+        self.ocv_canvas.draw_idle()
+
+    def reset_ocv_plot(self):
+        self.ocv_log.clear()
+        self.ocv_data_start_time = None
+        if self.ocv_line and self.ocv_ax:
+            self.ocv_line.set_data([], [])
+            self.ocv_ax.relim()
+            self.ocv_ax.autoscale_view()
+            self.ocv_canvas.draw_idle()
+
+    # ---------- Cap plot update / reset ----------
+    def update_cap_plot(self):
+        if not self.cap_ax or not self.cap_line:
+            return
+        if not self.cap_log:
+            return
+
+        xs_global = [row["t_sec"] for row in self.cap_log]
+        ys        = [row["cap"]   for row in self.cap_log]
+        if not xs_global:
+            return
+
+        if self.cap_time_mode.get() == "data" and self.cap_data_start_time is not None:
+            xs = [x - self.cap_data_start_time for x in xs_global]
+        else:
+            xs = xs_global
+
+        if self.cap_plot_style.get() == "Scatter":
+            self.cap_line.set_linestyle("")
+            self.cap_line.set_marker("s")
+        else:
+            self.cap_line.set_linestyle("-")
+            self.cap_line.set_marker("s")
+
+        self.cap_line.set_data(xs, ys)
+        self.cap_ax.relim()
+        self.cap_ax.autoscale_view()
+        self.cap_canvas.draw_idle()
+
+    def reset_cap_plot(self):
+        self.cap_log.clear()
+        self.cap_data_start_time = None
+        if self.cap_line and self.cap_ax:
+            self.cap_line.set_data([], [])
+            self.cap_ax.relim()
+            self.cap_ax.autoscale_view()
+            self.cap_canvas.draw_idle()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app  = CN0429GUI(root)
+    root.mainloop()
